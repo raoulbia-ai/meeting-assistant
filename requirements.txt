@@ -11,3 +11,4 @@ requests
 websockets
 scipy
 tenacity
+aiohttp
