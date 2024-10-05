@@ -4,7 +4,6 @@ import json
 import websockets
 import asyncio
 from dotenv import load_dotenv
-import logging
 import signal
 import sys
 import base64
@@ -24,10 +23,6 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 32000  # 32000 Hz as per mic specs
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
 class VoiceAssistant:
     def __init__(self):
         self.full_transcript = ""
@@ -38,9 +33,10 @@ class VoiceAssistant:
         self.silence_threshold = 500
         self.speech_start_frames = 5
         self.speech_end_frames = 20
+        self.question = ""
 
     def handle_exit(self, signal, frame):
-        logger.info("Exiting the application.")
+        print("\nExiting the application.")
         sys.exit(0)
 
     def generate_event_id(self):
@@ -52,7 +48,9 @@ class VoiceAssistant:
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
-                "instructions": "You are a helpful assistant. Your knowledge cutoff is 2023-10.",
+                "instructions": """You are a helpful assistant.
+                                    Act as a Computer Science and Fullsyack Developer.
+                                    Answer questions matter of fact, and be concise""",
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
@@ -62,56 +60,34 @@ class VoiceAssistant:
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 200
                 },
-                "temperature": 0.8
+                "temperature": 0.6,
+                "language": "en-US"
             }
         }
-        
-        logger.debug(f"Sending session update request: {json.dumps(session_update)}")
         await websocket.send(json.dumps(session_update))
-        
-        for attempt in range(5):
-            try:
-                response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                response_data = json.loads(response)
-                if response_data.get("type") in ["session.created", "session.updated"]:
-                    logger.info(f"Session {response_data.get('type')} successfully.")
-                    return True
-                elif response_data.get("type") == "error":
-                    error_data = response_data.get('error', {})
-                    logger.error(f"Error initializing session: {error_data.get('type')} - {error_data.get('code')} - {error_data.get('message')}")
-                    return False
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for session.")
-                await asyncio.sleep(1)
-        logger.error("Failed to initialize session after multiple attempts.")
-        return False
+        await websocket.recv()  # Wait for session initialization response
 
     def select_audio_device(self):
         p = pyaudio.PyAudio()
-        logger.info("Listing available audio devices:")
         for i in range(p.get_device_count()):
             device_info = p.get_device_info_by_index(i)
-            logger.info(f"Device {i}: {device_info['name']}")
-        
+            print(f"Device {i}: {device_info['name']}")
         device_index = int(input("Enter the device index for your microphone: "))
+        p.terminate()
         return device_index
 
     async def stream_audio_to_api(self, websocket):
         p = pyaudio.PyAudio()
         device_index = self.select_audio_device()
 
-        try:
-            stream = p.open(format=FORMAT,
-                            channels=CHANNELS,
-                            rate=RATE,
-                            input=True,
-                            input_device_index=device_index,
-                            frames_per_buffer=CHUNK)
-        except Exception as e:
-            logger.error(f"Failed to open stream: {str(e)}")
-            return
+        stream = p.open(format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RATE,
+                        input=True,
+                        input_device_index=device_index,
+                        frames_per_buffer=CHUNK)
 
-        logger.info(f"Streaming audio to API at {RATE} Hz...")
+        print("Listening... (Ctrl+C to exit)")
 
         try:
             while True:
@@ -136,9 +112,6 @@ class VoiceAssistant:
                     await self.send_audio_buffer(websocket)
 
                 await asyncio.sleep(0.01)
-
-        except Exception as e:
-            logger.error(f"Error in sending audio data: {str(e)}")
         finally:
             stream.stop_stream()
             stream.close()
@@ -147,7 +120,6 @@ class VoiceAssistant:
     async def send_audio_buffer(self, websocket):
         if len(self.audio_buffer) > 0:
             encoded_audio = base64.b64encode(self.audio_buffer).decode("utf-8")
-            
             append_message = {
                 "event_id": self.generate_event_id(),
                 "type": "input_audio_buffer.append",
@@ -155,50 +127,38 @@ class VoiceAssistant:
             }
             await websocket.send(json.dumps(append_message))
 
-            logger.debug(f"Sending audio chunk: {len(self.audio_buffer)} bytes")
-
             commit_message = {
                 "event_id": self.generate_event_id(),
                 "type": "input_audio_buffer.commit"
             }
             await websocket.send(json.dumps(commit_message))
-            
             self.audio_buffer = b""
-        else:
-            logger.debug("Audio buffer is empty. Skipping send.")
-
-    def process_audio_delta(self, message):
-        audio_data = base64.b64decode(message.get('audio', ''))
-        logger.debug(f"Received {len(audio_data)} bytes of audio data")
-        # Here you would typically send this to an audio player
 
     def process_transcript_delta(self, message):
         transcript_delta = message.get('delta', '')
         self.full_transcript += transcript_delta
-        logger.info(f"Transcript delta: {transcript_delta}")
-        logger.info(f"Full transcript: {self.full_transcript}")
+        if not self.question:
+            self.question = self.full_transcript
+        else:
+            print(transcript_delta, end='', flush=True)
+            # Check if the response has ended
+        if transcript_delta.strip().endswith('.') \
+            or transcript_delta.strip().endswith('?') \
+            or transcript_delta.strip().endswith('!'):
+            print('\n')  # Print a new line after the response
+            
 
     async def openai_realtime_api_interaction(self, websocket):
         try:
             while True:
                 response = await websocket.recv()
                 if isinstance(response, str):
-                    try:
-                        message = json.loads(response)
-                        if message['type'] == 'response.audio.delta':
-                            self.process_audio_delta(message)
-                        elif message['type'] == 'response.audio_transcript.delta':
-                            self.process_transcript_delta(message)
-                        elif message['type'] == 'error':
-                            logger.error(f"Error from API: {json.dumps(message)}")
-                        else:
-                            logger.debug(f"Received message type: {message['type']}")
-                    except json.JSONDecodeError:
-                        logger.error(f"Failed to parse JSON: {response}")
-                else:
-                    logger.warning(f"Received non-string message: {type(response)}")
-        except Exception as e:
-            logger.error(f"Error in receiving response: {str(e)}")
+                    message = json.loads(response)
+                    if message['type'] == 'response.audio_transcript.delta':
+                        self.process_transcript_delta(message)
+                        
+        except Exception:
+            pass
 
     async def keep_alive(self, websocket):
         while True:
@@ -209,49 +169,25 @@ class VoiceAssistant:
                 break
 
     async def main(self):
-        if not OPENAI_API_KEY:
-            logger.error("OPENAI_API_KEY is not set. Please check your .env file.")
-            return
-
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1"
         }
 
-        max_retries = 5
-        retry_delay = 1
-
-        for attempt in range(max_retries):
+        while True:
             try:
-                logger.info(f"Attempting to connect to {OPENAI_REALTIME_API_URL} (attempt {attempt + 1}/{max_retries})")
                 async with websockets.connect(OPENAI_REALTIME_API_URL, extra_headers=headers, timeout=30) as websocket:
-                    logger.info("Connected to Realtime API")
-
-                    logger.info("Initializing session...")
-                    if not await self.initialize_session(websocket):
-                        logger.error("Failed to initialize session. Exiting.")
-                        return
-
-                    logger.info("Session initialized successfully. Starting audio streaming...")
-
+                    await self.initialize_session(websocket)
+                    
                     keep_alive_task = asyncio.create_task(self.keep_alive(websocket))
                     send_audio_task = asyncio.create_task(self.stream_audio_to_api(websocket))
                     receive_response_task = asyncio.create_task(self.openai_realtime_api_interaction(websocket))
 
                     await asyncio.gather(keep_alive_task, send_audio_task, receive_response_task)
 
-            except (websockets.exceptions.WebSocketException, asyncio.TimeoutError) as e:
-                logger.error(f"Connection error (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    logger.error("Max retries reached. Exiting.")
-            except Exception as e:
-                logger.error(f"Unexpected error: {str(e)}")
-                break
-            finally:
-                logger.info("Closing WebSocket connection...")
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     assistant = VoiceAssistant()
