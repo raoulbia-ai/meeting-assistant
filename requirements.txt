@@ -1,0 +1,13 @@
+python-dotenv
+numpy
+pyaudio 
+# google-cloud-speech 
+# openai
+pytest
+openai-whisper 
+websocket-client 
+plyer
+requests
+websockets
+scipy
+tenacity

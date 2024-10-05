@@ -1,0 +1,8 @@
+interviewcompanion-2df440e2c540.json
+.env
+docs/
+*.log
+__pycache__/
+.history/
+.pytest_cache/
+v1/
