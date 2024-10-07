@@ -9,33 +9,48 @@ import sys
 import base64
 import uuid
 import numpy as np
+import webrtcvad
+import time
+import logging
 
-# Load environment variables
 load_dotenv()
 
-# Set OpenAI API credentials
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_REALTIME_API_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
 
-# Audio settings
-CHUNK = 2048
+CHUNK = 960
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 32000  # 32000 Hz as per mic specs
+RATE = 32000
+
+log_file = '/var/log/voice_assistant.log'
+os.makedirs(os.path.dirname(log_file), exist_ok=True)
+logging.basicConfig(
+    filename=log_file,
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 class VoiceAssistant:
     def __init__(self):
         self.full_transcript = ""
         self.audio_buffer = b""
+        self.speech_buffer = b""
+        self.speech_frames = 0
+        self.silence_frames = 0
         self.is_speaking = False
-        self.frames_above_threshold = 0
-        self.frames_below_threshold = 0
-        self.silence_threshold = 500
-        self.speech_start_frames = 5
-        self.speech_end_frames = 20
         self.question = ""
+        self.vad = webrtcvad.Vad(2)
+        self.frame_duration_ms = 30
+        self.min_speech_duration = 2.0  # Increased to 2 seconds
+        self.max_pause_duration = 0.3  # Keep as is
+        self.speech_extension_duration = 1.0  # Allow 1 second for speech to continue after min duration
+        self.last_api_call = 0
+        self.api_call_cooldown = 2.0
+        logging.info("VoiceAssistant initialized with updated parameters")
 
     def handle_exit(self, signal, frame):
+        logging.info("Exiting the application.")
         print("\nExiting the application.")
         sys.exit(0)
 
@@ -49,7 +64,7 @@ class VoiceAssistant:
             "session": {
                 "modalities": ["text", "audio"],
                 "instructions": """You are a helpful assistant.
-                                    Act as a Computer Science and Fullsyack Developer.
+                                    Act as a Computer Science and Fullstack Developer.
                                     Answer questions matter of fact, and be concise""",
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
@@ -65,7 +80,8 @@ class VoiceAssistant:
             }
         }
         await websocket.send(json.dumps(session_update))
-        await websocket.recv()  # Wait for session initialization response
+        await websocket.recv()
+        logging.info("Session initialized")
 
     def select_audio_device(self):
         p = pyaudio.PyAudio()
@@ -74,7 +90,35 @@ class VoiceAssistant:
             print(f"Device {i}: {device_info['name']}")
         device_index = int(input("Enter the device index for your microphone: "))
         p.terminate()
+        logging.info(f"Selected audio device index: {device_index}")
         return device_index
+
+    def is_speech(self, audio_segment):
+        return self.vad.is_speech(audio_segment, RATE)
+
+    async def process_audio(self, audio_data, websocket):
+        is_speech = self.is_speech(audio_data)
+        if is_speech or self.silence_frames * self.frame_duration_ms / 1000 <= self.max_pause_duration:
+            self.speech_buffer += audio_data
+            self.speech_frames += 1
+            self.silence_frames = 0 if is_speech else self.silence_frames + 1
+            speech_duration = self.speech_frames * self.frame_duration_ms / 1000
+            logging.debug(f"Speech detected, duration: {speech_duration:.2f}s")
+
+            if speech_duration >= self.min_speech_duration:
+                # Continue capturing for the extension duration
+                await asyncio.sleep(self.speech_extension_duration)
+                logging.info(f"Speech duration {speech_duration:.2f}s meets minimum. Sending to API.")
+                await self.send_audio_buffer(websocket)
+                self.reset_speech_detection()
+        elif self.speech_buffer:
+            logging.debug(f"Speech ended, duration: {speech_duration:.2f}s. Discarding (below minimum).")
+            self.reset_speech_detection()
+
+    def reset_speech_detection(self):
+        self.speech_buffer = b""
+        self.speech_frames = 0
+        self.silence_frames = 0
 
     async def stream_audio_to_api(self, websocket):
         p = pyaudio.PyAudio()
@@ -88,51 +132,41 @@ class VoiceAssistant:
                         frames_per_buffer=CHUNK)
 
         print("Listening... (Ctrl+C to exit)")
+        logging.info("Started listening for audio input")
 
         try:
             while True:
                 audio_data = stream.read(CHUNK, exception_on_overflow=False)
-                audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                volume = np.abs(audio_array).mean()
-
-                if volume > self.silence_threshold:
-                    self.frames_above_threshold += 1
-                    self.frames_below_threshold = 0
-                    if self.frames_above_threshold >= self.speech_start_frames:
-                        self.is_speaking = True
-                else:
-                    self.frames_below_threshold += 1
-                    self.frames_above_threshold = 0
-                    if self.frames_below_threshold >= self.speech_end_frames:
-                        self.is_speaking = False
-
-                if self.is_speaking:
-                    self.audio_buffer += audio_data
-                elif not self.is_speaking and self.audio_buffer:
-                    await self.send_audio_buffer(websocket)
-
+                await self.process_audio(audio_data, websocket)
                 await asyncio.sleep(0.01)
         finally:
             stream.stop_stream()
             stream.close()
             p.terminate()
+            logging.info("Stopped listening for audio input")
 
     async def send_audio_buffer(self, websocket):
-        if len(self.audio_buffer) > 0:
-            encoded_audio = base64.b64encode(self.audio_buffer).decode("utf-8")
-            append_message = {
-                "event_id": self.generate_event_id(),
-                "type": "input_audio_buffer.append",
-                "audio": encoded_audio
-            }
-            await websocket.send(json.dumps(append_message))
+        current_time = time.time()
+        if current_time - self.last_api_call >= self.api_call_cooldown:
+            if len(self.speech_buffer) > 0:
+                logging.info("Sending audio buffer to API")
+                encoded_audio = base64.b64encode(self.speech_buffer).decode("utf-8")
+                append_message = {
+                    "event_id": self.generate_event_id(),
+                    "type": "input_audio_buffer.append",
+                    "audio": encoded_audio
+                }
+                await websocket.send(json.dumps(append_message))
 
-            commit_message = {
-                "event_id": self.generate_event_id(),
-                "type": "input_audio_buffer.commit"
-            }
-            await websocket.send(json.dumps(commit_message))
-            self.audio_buffer = b""
+                commit_message = {
+                    "event_id": self.generate_event_id(),
+                    "type": "input_audio_buffer.commit"
+                }
+                await websocket.send(json.dumps(commit_message))
+                self.speech_buffer = b""
+            self.last_api_call = current_time
+        else:
+            logging.info("API call skipped due to cooldown")
 
     def process_transcript_delta(self, message):
         transcript_delta = message.get('delta', '')
@@ -141,31 +175,33 @@ class VoiceAssistant:
             self.question = self.full_transcript
         else:
             print(transcript_delta, end='', flush=True)
-            # Check if the response has ended
         if transcript_delta.strip().endswith('.') \
             or transcript_delta.strip().endswith('?') \
             or transcript_delta.strip().endswith('!'):
-            print('\n')  # Print a new line after the response
-            
+            print('\n')
+        logging.debug(f"Processed transcript delta: {transcript_delta}")
 
     async def openai_realtime_api_interaction(self, websocket):
         try:
             while True:
                 response = await websocket.recv()
+                logging.debug("Received response from API")
                 if isinstance(response, str):
                     message = json.loads(response)
                     if message['type'] == 'response.audio_transcript.delta':
                         self.process_transcript_delta(message)
-                        
-        except Exception:
-            pass
+                    logging.debug(f"Processed message type: {message['type']}")
+        except Exception as e:
+            logging.error(f"Error in API interaction: {str(e)}")
 
     async def keep_alive(self, websocket):
         while True:
             try:
                 await websocket.ping()
-                await asyncio.sleep(20)
-            except:
+                await asyncio.sleep(60)
+                logging.debug("Sent keep-alive ping")
+            except Exception as e:
+                logging.error(f"Error in keep-alive: {str(e)}")
                 break
 
     async def main(self):
@@ -176,7 +212,9 @@ class VoiceAssistant:
 
         while True:
             try:
+                logging.info("Attempting to connect to OpenAI API")
                 async with websockets.connect(OPENAI_REALTIME_API_URL, extra_headers=headers, timeout=30) as websocket:
+                    logging.info("Connected to OpenAI API")
                     await self.initialize_session(websocket)
                     
                     keep_alive_task = asyncio.create_task(self.keep_alive(websocket))
@@ -185,11 +223,13 @@ class VoiceAssistant:
 
                     await asyncio.gather(keep_alive_task, send_audio_task, receive_response_task)
 
-            except Exception:
-                pass
-
+            except Exception as e:
+                logging.error(f"Error in main loop: {str(e)}")
+                logging.info("Attempting to reconnect in 5 seconds...")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
     assistant = VoiceAssistant()
     signal.signal(signal.SIGINT, assistant.handle_exit)
+    logging.info("Starting Voice Assistant")
     asyncio.run(assistant.main())
