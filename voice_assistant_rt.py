@@ -54,18 +54,10 @@ class VoiceAssistant:
         self.api_call_cooldown = 2.0
         self.max_api_calls = max_api_calls
         self.api_calls_made = 0
-        self.TEXT_INPUT_PRICE_PER_MILLION = 5.00
-        self.TEXT_OUTPUT_PRICE_PER_MILLION = 20.00
-        self.AUDIO_INPUT_PRICE_PER_MILLION = 100.00
-        self.AUDIO_OUTPUT_PRICE_PER_MILLION = 200.00
-        self.input_tokens = 0
-        self.output_tokens = 0
-        self.total_cost = 0.0
         logging.info("VoiceAssistant initialized with updated parameters")
 
     def handle_exit(self, signal, frame):
         logging.info("Interrupt received, ending session...")
-        self.log_session_stats()
         logging.info("Exiting the application.")
         sys.exit(0)
 
@@ -90,13 +82,12 @@ class VoiceAssistant:
                     "silence_duration_ms": 200
                 },
                 "temperature": 0.6,
-                "language": "en-US",
-                "stream_options": {"include_usage": True}
+                "language": "en-US"
             }
         }
         await websocket.send(json.dumps(session_update))
         await websocket.recv()
-        logging.info("Session initialized with usage tracking enabled")
+        logging.info("Session initialized")
 
     def select_audio_device(self):
         p = pyaudio.PyAudio()
@@ -184,28 +175,6 @@ class VoiceAssistant:
         else:
             logging.info("API call skipped due to cooldown")
 
-    def update_token_usage(self, usage):
-        input_tokens = usage.get('input_tokens', 0)
-        output_tokens = usage.get('output_tokens', 0)
-        audio_input_tokens = usage.get('audio_input_tokens', 0)
-        audio_output_tokens = usage.get('audio_output_tokens', 0)
-        
-        self.input_tokens += input_tokens + audio_input_tokens
-        self.output_tokens += output_tokens + audio_output_tokens
-        
-        text_input_cost = (input_tokens / 1_000_000) * self.TEXT_INPUT_PRICE_PER_MILLION
-        text_output_cost = (output_tokens / 1_000_000) * self.TEXT_OUTPUT_PRICE_PER_MILLION
-        audio_input_cost = (audio_input_tokens / 1_000_000) * self.AUDIO_INPUT_PRICE_PER_MILLION
-        audio_output_cost = (audio_output_tokens / 1_000_000) * self.AUDIO_OUTPUT_PRICE_PER_MILLION
-        
-        response_cost = text_input_cost + text_output_cost + audio_input_cost + audio_output_cost
-        self.total_cost += response_cost
-        
-        logging.info(f"Token usage - Text Input: {input_tokens}, Text Output: {output_tokens}")
-        logging.info(f"Token usage - Audio Input: {audio_input_tokens}, Audio Output: {audio_output_tokens}")
-        logging.info(f"Response cost: ${response_cost:.6f}")
-        logging.info(f"Total cost so far: ${self.total_cost:.6f}")
-
     def process_transcript_delta(self, message):
         transcript_delta = message.get('delta', '')
         self.full_transcript += transcript_delta
@@ -228,8 +197,6 @@ class VoiceAssistant:
                     message = json.loads(response)
                     if message['type'] == 'response.audio_transcript.delta':
                         self.process_transcript_delta(message)
-                    elif message['type'] == 'response.usage':
-                        self.update_token_usage(message['usage'])
                     elif message['type'] == 'response.complete':
                         logging.info("Response complete")
                     logging.debug(f"Processed message type: {message['type']}")
@@ -245,18 +212,6 @@ class VoiceAssistant:
             except Exception as e:
                 logging.error(f"Error in keep-alive: {str(e)}")
                 break
-
-    async def shutdown(self):
-        logging.info("Shutting down Voice Assistant...")
-        if hasattr(self, 'websocket') and self.websocket.open:
-            await self.websocket.close()
-
-    def log_session_stats(self):
-        logging.info("=== Session Statistics ===")
-        logging.info(f"Total API calls made: {self.api_calls_made}")
-        logging.info(f"Total input tokens: {self.input_tokens}")
-        logging.info(f"Total output tokens: {self.output_tokens}")
-        logging.info(f"Total session cost: ${self.total_cost:.6f}")
 
     async def main(self):
         headers = {
@@ -276,8 +231,6 @@ class VoiceAssistant:
                 await asyncio.gather(keep_alive_task, send_audio_task, receive_response_task)
         except Exception as e:
             logging.error(f"Error in main loop: {str(e)}")
-        finally:
-            await self.shutdown()
 
 if __name__ == "__main__":
     max_api_calls = int(input("Enter maximum number of API calls (-1 for unlimited): "))
@@ -285,7 +238,4 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, assistant.handle_exit)
     signal.signal(signal.SIGTERM, assistant.handle_exit)
     logging.info("Starting Voice Assistant")
-    try:
-        asyncio.run(assistant.main())
-    finally:
-        assistant.log_session_stats()
+    asyncio.run(assistant.main())
